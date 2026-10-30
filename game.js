@@ -17,7 +17,7 @@ const SPEED = 2.2;       // клеток в секунду
 const SRC_INT = 1.5;     // источник выпускает кружок раз в N секунд
 const WEEK = 45;         // длина недели, с
 const BITE = 0.13;       // насколько один кружок утоляет голод приёмника
-const PATIENCE0 = 45;    // за сколько секунд голодный приёмник лопается в начале
+const PATIENCE0 = 60;    // за сколько секунд голодный приёмник лопается в начале
 const PATIENCE_MIN = 16; // и к чему это время сжимается
 const TOP = 70, BOT = 96;
 const BG = '#efece6', INK = '#2a2a2d', BELT = '#d8d2c7';
@@ -93,7 +93,7 @@ function pickFlow(c, m) {
 }
 
 function addNode(type, x, y, color) {
-  const n = { id: S.id++, type, x, y, color, born: S.t, outQ: [], slots: [], timer: 0, pulse: 0, rr: 0 };
+  const n = { id: S.id++, type, x, y, color, born: S.t, outQ: [], slots: [], timer: 0, pulse: 0, rr: 0, links: [] };
   if (type === 'rcv') Object.assign(n, { want: color, fill: 0, patience: PATIENCE0, pop: 0, fed: 0 });
   S.nodes.push(n);
   cellMk(x, y).node = n;
@@ -160,7 +160,8 @@ function pickWant() {
   const avail = producible();
   const taken = S.nodes.filter(n => n.type === 'rcv').map(n => n.want);
   const indirect = avail.filter(c => !direct.has(c));
-  let pool = indirect.length && Math.random() < 0.6 ? indirect : avail;
+  // Первая неделя — только цвета прямо из источников, смешивать учимся со второй
+  let pool = S.week < 2 ? avail.filter(c => direct.has(c)) : indirect.length && Math.random() < 0.5 ? indirect : avail;
   const fresh = pool.filter(c => !taken.includes(c));
   if (fresh.length && Math.random() < 0.7) pool = fresh;
   return pool[rnd(pool.length)];
@@ -309,14 +310,21 @@ function emit(n) {
     const outs = [];
     for (const e of DIRS) {
       const cc = cell(n.x + e.x, n.y + e.y);
+      if (!cc) continue;
+      // Соседний узел, соединённый напрямую
+      if (cc.node) {
+        if (n.links.some(d => same(d, e)) && freeTo(n, e, c)) outs.push({ t: cc.node, e });
+        continue;
+      }
       const f = pickFlow(cc, e);
       if (f && !f.dot && f.link && same(f.link, e)) outs.push({ cc, f, e });
     }
     if (!outs.length) return;
-    const good = outs.filter(o => dests(n, o.e).some(t => wants(t, c)));
+    const good = outs.filter(o => (o.t ? [o.t] : dests(n, o.e)).some(t => wants(t, c)));
     const pool = good.length ? good : outs;
     const o = pool[(n.rr++) % pool.length];
-    o.f.dot = { c, p: 0, m: { ...o.e }, born: S.t, fr: frameNo };
+    if (o.t) { if (!accept(o.t, c)) return; }
+    else o.f.dot = { c, p: 0, m: { ...o.e }, born: S.t, fr: frameNo };
     n.outQ.shift();
     if (n.type === 'src') n.pulse = 1;
   }
@@ -377,6 +385,7 @@ function planPath(p, apply) {
     const q = p[i], c = cell(q.x, q.y);
     if (c && c.node) continue;
     if (apply && i > 0) linkLater.push(i);
+    if (apply && i === 0 && n > 1 && !(c && c.flows.length)) linkLater.push(-1);
     const fl = c ? c.flows : [];
     const inM = i > 0 ? { x: q.x - p[i - 1].x, y: q.y - p[i - 1].y } : null;
     const outM = i < n - 1 ? { x: p[i + 1].x - q.x, y: p[i + 1].y - q.y } : null;
@@ -418,6 +427,13 @@ function planPath(p, apply) {
     S.inv.belt -= cost; S.inv.bridge -= bridges;
     // Ленту тянули от узла — узел выдаёт в неё кружки
     for (const i of linkLater) {
+      if (i < 0) {
+        // Начал ленту на пустой клетке рядом с узлом и повёл прочь от него — тоже подключение
+        const q = p[0], c = cell(q.x, q.y), f = c && c.flows[0];
+        const pc = f && cell(q.x - f.dir.x, q.y - f.dir.y);
+        if (pc && pc.node && pc.node.type !== 'rcv' && c.flows.length === 1) f.link = { ...f.dir };
+        continue;
+      }
       const q = p[i], pc = cell(p[i - 1].x, p[i - 1].y), c = cell(q.x, q.y);
       if (!pc || !pc.node || pc.node.type === 'rcv' || !c || c.flows.length !== 1) continue;
       const m = { x: q.x - pc.x, y: q.y - pc.y };
@@ -470,6 +486,12 @@ function step(x, y) {
     p.push({ x, y }); drag.ended = true;
     return true;
   }
+  // Прямо поперёк чужой ленты без моста не пройти: кисть упирается и вливается в неё
+  const L = p[p.length - 1], P = p[p.length - 2], lc = cell(L.x, L.y);
+  if (P && lc && !lc.node && lc.flows.length === 1 && L.x - P.x === x - L.x && L.y - P.y === y - L.y
+      && axis(lc.flows[0].dir) !== axis({ x: x - L.x, y: y - L.y }) && planPath(p, false).bridges >= S.inv.bridge) {
+    bump('bridge'); return false;
+  }
   p.push({ x, y });
   if (planPath(p, false).cost > S.inv.belt) { p.pop(); bump('belt'); return false; }
   return true;
@@ -478,6 +500,15 @@ function step(x, y) {
 function commitDrag() {
   if (!drag || drag.path.length < 2) return;
   const r = planPath(drag.path, true);
+  // Два узла вплотную: протянул от одного к другому — соединил без ленты
+  const p = drag.path;
+  for (let i = 0; i + 1 < p.length; i++) {
+    const a = cell(p[i].x, p[i].y), b = cell(p[i + 1].x, p[i + 1].y);
+    if (!a || !b || !a.node || !b.node || a.node.type === 'rcv' || b.node.type === 'src') continue;
+    const e = { x: b.x - a.x, y: b.y - a.y };
+    if (!a.node.links.some(d => same(d, e))) a.node.links.push(e);
+    b.node.links = b.node.links.filter(d => !opp(d, e));
+  }
   tone(7, 0.1, 0.04); tone(12, 0.12, 0.03);
   if (r.bridges) tone(16, 0.15, 0.03);
   if (!S.hinted.first) { S.hinted.first = true; hide('hint'); }
@@ -517,6 +548,7 @@ function eraseAt(x, y) {
 function unlink(x, y) {
   for (const e of DIRS) {
     const nc = cell(x - e.x, y - e.y);
+    if (nc && nc.node) nc.node.links = nc.node.links.filter(d => !same(d, e));
     if (!nc || nc.flows.length !== 1) continue;
     const f = nc.flows[0];
     if (!f.alt.length) continue;
@@ -530,14 +562,18 @@ function unlink(x, y) {
 const canPlace = (x, y) => { const c = cell(x, y); return inB(x, y) && (!c || (!c.node && c.flows.length <= 1)); };
 function placeNode(k, x, y) {
   const c = cell(x, y), f = c && c.flows[0];
-  const outs = f ? outsOf(f) : [];
+  const outs = f ? outsOf(f) : [], link = f && f.link;
   if (f) { dropDots(c); c.flows = []; S.inv.belt++; }
-  addNode(k, x, y);
+  const n = addNode(k, x, y);
   for (const o of outs) {
     const nc = cell(x + o.x, y + o.y);
-    const t = nc && !nc.node && pickFlow(nc, o);
+    if (nc && nc.node) { if (nc.node.type !== 'src') n.links.push({ ...o }); continue; }
+    const t = nc && pickFlow(nc, o);
     if (t && nc.flows.length === 1) t.link = { ...o };
   }
+  // Лента шла прямо из узла — теперь тот узел выдаёт прямо в новый
+  const from = link && cell(x - link.x, y - link.y);
+  if (from && from.node) from.node.links.push({ ...link });
 }
 
 // ---------- ввод ----------
@@ -834,6 +870,9 @@ function draw() {
     ctx.globalAlpha = 1;
   }
 
+  const ties = [];
+  for (const n of S.nodes) for (const e of n.links) ties.push([{ x: n.x, y: n.y }, { x: n.x + e.x, y: n.y + e.y }]);
+  if (ties.length) { stroke(ties, 0.46, BELT); stroke(ties, 0.07, 'rgba(255,255,255,.75)', true); }
   for (const n of S.nodes) drawNode(n);
 
   for (const p of S.parts) {
