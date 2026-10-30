@@ -78,7 +78,10 @@ function cellMk(x, y) {
   return c;
 }
 const inB = (x, y) => x >= S.b.x0 && x <= S.b.x1 && y >= S.b.y0 && y <= S.b.y1;
-const mkFlow = dir => ({ dir: { x: dir.x, y: dir.y }, dot: null, jam: 0, born: S.t });
+const mkFlow = dir => ({ dir: { x: dir.x, y: dir.y }, alt: [], dot: null, jam: 0, born: S.t, rr: 0 });
+// Все выходы потока: основной и ответвления развилки
+const outsOf = f => f.alt.length ? [f.dir, ...f.alt] : [f.dir];
+const outOf = (f, d) => d.o || f.dir;
 const busy = c => !!c && (!!c.node || c.flows.length > 0);
 
 // В какой поток клетки попадёт кружок, едущий в направлении m
@@ -224,7 +227,16 @@ function updRcv(n, dt) {
 function moveDot(c, f, dt) {
   const d = f.dot;
   if (d.fr === frameNo) return;
-  const nc = cell(c.x + f.dir.x, c.y + f.dir.y);
+  // На развилке кружок выбирает ветку в центре клетки; если все нужные ветки заняты — ждёт
+  if (f.alt.length && !d.o) {
+    d.p = Math.min(d.p + SPEED * dt, 0.5);
+    if (d.p < 0.5) return;
+    const o = chooseOut(c, f, d.c);
+    if (!o) return;
+    d.o = { ...o };
+  }
+  const o = outOf(f, d);
+  const nc = cell(c.x + o.x, c.y + o.y);
   const lim = busy(nc) ? 1 : 0.75; // на обрыве ленты кружок стоит у края
   d.p = Math.min(d.p + SPEED * dt, lim);
   if (d.p < 1) { f.jam = 0; return; }
@@ -233,21 +245,45 @@ function moveDot(c, f, dt) {
     else f.jam = wrong(nc.node, d.c) ? f.jam + dt : 0;
     return;
   }
-  const t = pickFlow(nc, f.dir);
-  if (t && !t.dot) { t.dot = d; d.p -= 1; d.m = { ...f.dir }; d.fr = frameNo; f.dot = null; f.jam = 0; }
+  const t = pickFlow(nc, o);
+  if (t && !t.dot) { t.dot = d; d.p -= 1; d.m = { ...o }; d.o = null; d.fr = frameNo; f.dot = null; f.jam = 0; }
 }
 
-// Куда в итоге приедет кружок, если пустить его по ленте из клетки c в направлении m
-function trace(c, m) {
-  for (let i = 0; i < 150 && c; i++) {
-    const f = pickFlow(c, m);
-    if (!f) return null;
-    const nc = cell(c.x + f.dir.x, c.y + f.dir.y);
-    if (!nc) return null;
-    if (nc.node) return nc.node;
-    m = f.dir; c = nc;
+// Свободна ли следующая клетка в сторону o (для узла — примет ли он цвет прямо сейчас)
+function freeTo(c, o, col) {
+  const nc = cell(c.x + o.x, c.y + o.y);
+  if (!nc) return false;
+  if (nc.node) return nc.node.type !== 'src' && !wrong(nc.node, col) && (nc.node.type !== 'rcv' || nc.node.fill >= 0.03);
+  const t = pickFlow(nc, o);
+  return !!t && !t.dot;
+}
+
+// Ветки, которые ведут к тому, кому этот цвет нужен; среди свободных — по очереди
+function chooseOut(c, f, col) {
+  const live = outsOf(f).filter(o => busy(cell(c.x + o.x, c.y + o.y)));
+  if (!live.length) return f.dir;
+  const good = live.filter(o => dests(c, o).some(n => wants(n, col)));
+  const free = (good.length ? good : live).filter(o => freeTo(c, o, col));
+  if (!free.length) return null;
+  return free[(f.rr++) % free.length];
+}
+
+// Все узлы, куда может приехать кружок, выйдя из клетки c в сторону o (с учётом развилок)
+function dests(c, o) {
+  const out = [], seen = new Set(), st = [[c, o]];
+  while (st.length && seen.size < 300) {
+    const [a, m] = st.pop();
+    const nc = cell(a.x + m.x, a.y + m.y);
+    if (!nc) continue;
+    if (nc.node) { if (!out.includes(nc.node)) out.push(nc.node); continue; }
+    const f = pickFlow(nc, m);
+    if (!f) continue;
+    const k = key(nc.x, nc.y) + (nc.flows.length === 2 ? axis(m) : '');
+    if (seen.has(k)) continue;
+    seen.add(k);
+    for (const d of outsOf(f)) st.push([nc, d]);
   }
-  return null;
+  return out;
 }
 
 function wants(n, c) {
@@ -276,7 +312,9 @@ function emit(n) {
       if (f && !f.dot) outs.push({ cc, f, e });
     }
     if (!outs.length) return;
-    const o = outs.find(o => { const t = trace(o.cc, o.e); return t && wants(t, c); }) || outs[(n.rr++) % outs.length];
+    const good = outs.filter(o => dests(n, o.e).some(t => wants(t, c)));
+    const pool = good.length ? good : outs;
+    const o = pool[(n.rr++) % pool.length];
     o.f.dot = { c, p: 0, m: { ...o.e }, born: S.t, fr: frameNo };
     n.outQ.shift();
     if (n.type === 'src') n.pulse = 1;
@@ -350,6 +388,16 @@ function planPath(p, apply) {
       if (apply) cellMk(q.x, q.y).flows = [mkFlow(outM)];
       continue;
     }
+    // Начал рисовать с середины ленты — получается развилка, лента не поворачивает
+    if (!inM) {
+      if (fl.length === 2) continue;
+      const f = fl[0];
+      if (outsOf(f).some(d => same(d, outM))) continue;
+      const leads = busy(cell(q.x + f.dir.x, q.y + f.dir.y));
+      if (leads && !feedsFrom(c, outM)) { if (apply) f.alt.push({ ...outM }); continue; }
+      if (apply) { f.dir = { ...outM }; f.alt = []; }
+      continue;
+    }
     if (inM && same(inM, outM)) {
       if (fl.length === 1 && axis(fl[0].dir) !== axis(outM) && S.inv.bridge - bridges > 0) {
         bridges++;
@@ -361,7 +409,7 @@ function planPath(p, apply) {
     }
     if (!apply) continue;
     if (fl.length === 2) { dropDots(c); S.inv.bridge++; c.flows = [mkFlow(outM)]; }
-    else fl[0].dir = { ...outM };
+    else { fl[0].dir = { ...outM }; fl[0].alt = []; if (fl[0].dot) fl[0].dot.o = null; }
   }
   if (apply) { S.inv.belt -= cost; S.inv.bridge -= bridges; }
   return { cost, bridges };
@@ -436,6 +484,7 @@ function eraseAt(x, y) {
     if (n.type !== 'mix' && n.type !== 'split') return;
     c.node = null;
     S.nodes = S.nodes.filter(m => m !== n);
+    unlink(x, y);
     S.inv[n.type]++;
     burst(n.x, n.y, n.type === 'mix' ? '#cfc8bb' : '#1f1f22', 6);
     bump(n.type);
@@ -444,11 +493,25 @@ function eraseAt(x, y) {
     S.inv.belt++;
     if (c.flows.length === 2) S.inv.bridge++;
     c.flows = [];
+    unlink(x, y);
     burst(x, y, '#c9c1b4', 3);
     bump('belt');
   } else return;
   tone(-3 + rnd(3), 0.06, 0.03, 'triangle');
   updPanel();
+}
+
+// Клетку стёрли: соседние развилки забывают ветку, которая туда вела
+function unlink(x, y) {
+  for (const e of DIRS) {
+    const nc = cell(x - e.x, y - e.y);
+    if (!nc || nc.flows.length !== 1) continue;
+    const f = nc.flows[0];
+    if (!f.alt.length) continue;
+    f.alt = f.alt.filter(d => !same(d, e));
+    if (same(f.dir, e) && f.alt.length) f.dir = f.alt.shift();
+    if (f.dot && f.dot.o && same(f.dot.o, e)) { f.dot.o = null; f.dot.p = Math.min(f.dot.p, 0.5); }
+  }
 }
 
 const canPlace = (x, y) => inB(x, y) && !busy(cell(x, y));
@@ -556,6 +619,7 @@ function showStart() {
     <p>Рисуй ленты от цветных источников к тёмным приёмникам. Каждый приёмник ест свой цвет и всё время голоден.</p>
     <p><span class="d w"></span> белый смеситель: ${dot('R')} + ${dot('Y')} = ${dot('O')}<br>
     <span class="d" style="background:#1f1f22"></span> чёрный разделитель: ${dot('O')} → ${dot('R')} + ${dot('Y')}</p>
+    <p>Начни новую ленту с середины старой — будет развилка: кружки сами поедут туда, где их цвет нужен.</p>
     <p>Ластик в панели (или правая кнопка мыши) стирает по клеткам.</p>
     <button class="main" id="go">Играть</button>
     ${best ? `<small>Рекорд: ${best}</small>` : ''}`);
@@ -611,11 +675,14 @@ function polyline(p) { ctx.beginPath(); ctx.moveTo(p[0].x, p[0].y); for (let i =
 
 // Соседняя клетка в стороне e подаёт кружки в поток f этой клетки?
 function feeds(c, e, f) {
-  if (same(f.dir, e)) return false;
+  if (outsOf(f).some(d => same(d, e))) return false;
+  return feedsFrom(c, e);
+}
+function feedsFrom(c, e) {
   const nc = cell(c.x + e.x, c.y + e.y);
   if (!nc) return false;
   if (nc.node) return nc.node.type !== 'rcv';
-  return nc.flows.some(g => opp(g.dir, e));
+  return nc.flows.some(g => outsOf(g).some(d => opp(d, e)));
 }
 
 function stroke(segs, w, color, dash) {
@@ -632,14 +699,16 @@ function drawFlow(c, f, straight) {
   let segs, main;
   if (straight) {
     const a = { x: c.x - f.dir.x * 0.5, y: c.y - f.dir.y * 0.5 }, b = { x: c.x + f.dir.x * 0.5, y: c.y + f.dir.y * 0.5 };
-    segs = [[a, b]]; main = [a, b];
+    segs = [[a, b]]; main = [[a, b]];
   } else {
     const ins = DIRS.filter(e => feeds(c, e, f));
-    const len = busy(cell(c.x + f.dir.x, c.y + f.dir.y)) ? 0.5 : 0.22;
-    const out = { x: c.x + f.dir.x * len, y: c.y + f.dir.y * len };
+    const outs = outsOf(f).map(d => {
+      const len = busy(cell(c.x + d.x, c.y + d.y)) ? 0.5 : 0.22;
+      return { x: c.x + d.x * len, y: c.y + d.y * len };
+    });
     segs = ins.map(e => [{ x: c.x + e.x * 0.5, y: c.y + e.y * 0.5 }, ctr]);
-    segs.push([ctr, out]);
-    main = ins.length ? [segs[0][0], ctr, out] : [ctr, out];
+    for (const o of outs) segs.push([ctr, o]);
+    main = outs.map(o => ins.length ? [segs[0][0], ctr, o] : [ctr, o]);
   }
   const k = easeOut(clamp((S.t - f.born) / 0.2));
   stroke(segs, 0.46 * k, BELT);
@@ -648,7 +717,7 @@ function drawFlow(c, f, straight) {
     stroke(segs, 0.46, '#e8453c');
     ctx.globalAlpha = 1;
   }
-  stroke([main], 0.07, 'rgba(255,255,255,.75)', true);
+  stroke(main, 0.07, 'rgba(255,255,255,.75)', true);
 }
 
 // Бортики моста под верхней лентой
@@ -660,7 +729,8 @@ function drawRails(c, f) {
 
 function dotPos(c, f, d) {
   if (d.p < 0.5) return { x: c.x - d.m.x * (0.5 - d.p), y: c.y - d.m.y * (0.5 - d.p) };
-  return { x: c.x + f.dir.x * (d.p - 0.5), y: c.y + f.dir.y * (d.p - 0.5) };
+  const o = outOf(f, d);
+  return { x: c.x + o.x * (d.p - 0.5), y: c.y + o.y * (d.p - 0.5) };
 }
 
 function drawDot(c, f) {
