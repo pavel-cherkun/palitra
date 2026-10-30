@@ -78,7 +78,8 @@ function cellMk(x, y) {
   return c;
 }
 const inB = (x, y) => x >= S.b.x0 && x <= S.b.x1 && y >= S.b.y0 && y <= S.b.y1;
-const mkFlow = dir => ({ dir: { x: dir.x, y: dir.y }, alt: [], dot: null, jam: 0, born: S.t, rr: 0 });
+// link — с какой стороны в поток выдаёт узел (только если ленту тянули от узла)
+const mkFlow = dir => ({ dir: { x: dir.x, y: dir.y }, alt: [], link: null, dot: null, jam: 0, born: S.t, rr: 0 });
 // Все выходы потока: основной и ответвления развилки
 const outsOf = f => f.alt.length ? [f.dir, ...f.alt] : [f.dir];
 const outOf = (f, d) => d.o || f.dir;
@@ -309,7 +310,7 @@ function emit(n) {
     for (const e of DIRS) {
       const cc = cell(n.x + e.x, n.y + e.y);
       const f = pickFlow(cc, e);
-      if (f && !f.dot) outs.push({ cc, f, e });
+      if (f && !f.dot && f.link && same(f.link, e)) outs.push({ cc, f, e });
     }
     if (!outs.length) return;
     const good = outs.filter(o => dests(n, o.e).some(t => wants(t, c)));
@@ -369,11 +370,13 @@ function gameOver(n) {
 // на чужой ленте означает «влиться в неё».
 function planPath(p, apply) {
   let cost = 0, bridges = 0;
+  const linkLater = [];
   const n = p.length;
   if (n < 2) return { cost, bridges };
   for (let i = 0; i < n; i++) {
     const q = p[i], c = cell(q.x, q.y);
     if (c && c.node) continue;
+    if (apply && i > 0) linkLater.push(i);
     const fl = c ? c.flows : [];
     const inM = i > 0 ? { x: q.x - p[i - 1].x, y: q.y - p[i - 1].y } : null;
     const outM = i < n - 1 ? { x: p[i + 1].x - q.x, y: p[i + 1].y - q.y } : null;
@@ -411,7 +414,16 @@ function planPath(p, apply) {
     if (fl.length === 2) { dropDots(c); S.inv.bridge++; c.flows = [mkFlow(outM)]; }
     else { fl[0].dir = { ...outM }; fl[0].alt = []; if (fl[0].dot) fl[0].dot.o = null; }
   }
-  if (apply) { S.inv.belt -= cost; S.inv.bridge -= bridges; }
+  if (apply) {
+    S.inv.belt -= cost; S.inv.bridge -= bridges;
+    // Ленту тянули от узла — узел выдаёт в неё кружки
+    for (const i of linkLater) {
+      const q = p[i], pc = cell(p[i - 1].x, p[i - 1].y), c = cell(q.x, q.y);
+      if (!pc || !pc.node || pc.node.type === 'rcv' || !c || c.flows.length !== 1) continue;
+      const m = { x: q.x - pc.x, y: q.y - pc.y };
+      if (!opp(c.flows[0].dir, m)) c.flows[0].link = m;
+    }
+  }
   return { cost, bridges };
 }
 
@@ -514,7 +526,19 @@ function unlink(x, y) {
   }
 }
 
-const canPlace = (x, y) => inB(x, y) && !busy(cell(x, y));
+// Смеситель и разделитель можно ставить на пустую клетку или прямо на ленту (и на развилку)
+const canPlace = (x, y) => { const c = cell(x, y); return inB(x, y) && (!c || (!c.node && c.flows.length <= 1)); };
+function placeNode(k, x, y) {
+  const c = cell(x, y), f = c && c.flows[0];
+  const outs = f ? outsOf(f) : [];
+  if (f) { dropDots(c); c.flows = []; S.inv.belt++; }
+  addNode(k, x, y);
+  for (const o of outs) {
+    const nc = cell(x + o.x, y + o.y);
+    const t = nc && !nc.node && pickFlow(nc, o);
+    if (t && nc.flows.length === 1) t.link = { ...o };
+  }
+}
 
 // ---------- ввод ----------
 function toWorld(px, py) {
@@ -577,7 +601,7 @@ addEventListener('pointerup', () => {
   if (!place) return;
   const w = toWorld(place.x, place.y), x = Math.round(w.x), y = Math.round(w.y);
   if (live() && canPlace(x, y) && S.inv[place.k] > 0) {
-    addNode(place.k, x, y); S.inv[place.k]--;
+    placeNode(place.k, x, y); S.inv[place.k]--;
     tone(place.k === 'mix' ? 12 : 0, 0.12, 0.04, 'triangle');
   }
   place = null; updPanel();
@@ -619,7 +643,7 @@ function showStart() {
     <p>Рисуй ленты от цветных источников к тёмным приёмникам. Каждый приёмник ест свой цвет и всё время голоден.</p>
     <p><span class="d w"></span> белый смеситель: ${dot('R')} + ${dot('Y')} = ${dot('O')}<br>
     <span class="d" style="background:#1f1f22"></span> чёрный разделитель: ${dot('O')} → ${dot('R')} + ${dot('Y')}</p>
-    <p>Начни новую ленту с середины старой — будет развилка: кружки сами поедут туда, где их цвет нужен.</p>
+    <p>Источник выдаёт кружки только в ленты, протянутые от него. Начни ленту с середины другой — будет развилка. Смеситель и разделитель можно ставить прямо на ленту.</p>
     <p>Ластик в панели (или правая кнопка мыши) стирает по клеткам.</p>
     <button class="main" id="go">Играть</button>
     ${best ? `<small>Рекорд: ${best}</small>` : ''}`);
@@ -681,7 +705,7 @@ function feeds(c, e, f) {
 function feedsFrom(c, e) {
   const nc = cell(c.x + e.x, c.y + e.y);
   if (!nc) return false;
-  if (nc.node) return nc.node.type !== 'rcv';
+  if (nc.node) return c.flows.length === 1 && !!c.flows[0].link && opp(c.flows[0].link, e);
   return nc.flows.some(g => outsOf(g).some(d => opp(d, e)));
 }
 
