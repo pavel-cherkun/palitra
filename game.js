@@ -127,13 +127,14 @@ function producible() {
 function newGame() {
   const portrait = innerHeight > innerWidth;
   S = {
-    t: 0, score: 0, week: 1, weekT: 0, paused: false, over: false, running: false, overT: 0,
+    t: 0, score: 0, week: 1, weekT: 0, paused: false, hold: false, over: false, running: false, overT: 0,
     b: portrait ? { x0: -3, y0: -5, x1: 3, y1: 5 } : { x0: -6, y0: -3, x1: 6, y1: 3 },
     vb: null, portrait, nodes: [], cells: new Map(), parts: [], id: 1,
     inv: { belt: 40, mix: 1, split: 1, bridge: 1 },
     srcT: 26, rcvT: 18, srcCount: 0, hinted: {}, failNode: null,
   };
   S.vb = { ...S.b };
+  document.body.classList.remove('hold');
   if (portrait) { addNode('src', -2, -3, 'R'); addNode('src', 2, -3, 'B'); addNode('rcv', 0, 3, 'R'); }
   else { addNode('src', -4, -2, 'R'); addNode('src', -4, 2, 'B'); addNode('rcv', 4, 0, 'R'); }
   drag = null; erasing = null; place = null;
@@ -582,6 +583,16 @@ function toWorld(px, py) {
   return { x: (px - W / 2) / cam.s + cam.x, y: (py - cy) / cam.s + cam.y };
 }
 const live = () => S && S.running && !S.over && !S.paused;
+// Стоп-кадр: время стоит, а строить и стирать можно
+const ticking = () => live() && !S.hold;
+function setHold(on) {
+  if (!S) return;
+  S.hold = on;
+  document.body.classList.toggle('hold', on);
+  $('#pause').setAttribute('aria-label', on ? 'Продолжить' : 'Пауза');
+  if (on) hint('Пауза: время стоит, строить можно. Пробел или ▶ — продолжить');
+  else hide('hint');
+}
 const cellAt = e => { const w = toWorld(e.clientX, e.clientY); return { x: Math.round(w.x), y: Math.round(w.y) }; };
 
 cv.addEventListener('pointerdown', e => {
@@ -643,8 +654,9 @@ addEventListener('pointerup', () => {
   place = null; updPanel();
 });
 
-$('#pause').addEventListener('click', () => { if (live()) showPause(); });
-document.addEventListener('visibilitychange', () => { if (document.hidden && live()) showPause(); });
+$('#pause').addEventListener('click', () => { audioInit(); if (live()) setHold(!S.hold); });
+addEventListener('keydown', e => { if (e.code === 'Space' && live()) { e.preventDefault(); setHold(!S.hold); } });
+document.addEventListener('visibilitychange', () => { if (document.hidden && live()) setHold(true); });
 
 // ---------- интерфейс ----------
 const ovEl = $('#ov'), hintEl = $('#hint');
@@ -851,6 +863,7 @@ function draw() {
   const v = S.vb;
   rr(v.x0 - 0.5, v.y0 - 0.5, v.x1 - v.x0 + 1, v.y1 - v.y0 + 1, 0.4);
   ctx.fillStyle = '#f7f5f0'; ctx.fill();
+  if (S.hold) { ctx.setLineDash([0.25, 0.18]); ctx.lineWidth = 0.06; ctx.strokeStyle = 'rgba(42,42,45,.35)'; ctx.stroke(); ctx.setLineDash([]); }
   ctx.fillStyle = 'rgba(42,42,45,.08)';
   for (let x = S.b.x0; x <= S.b.x1; x++) for (let y = S.b.y0; y <= S.b.y1; y++) { ctx.beginPath(); ctx.arc(x, y, 0.035, 0, Math.PI * 2); ctx.fill(); }
 
@@ -908,7 +921,7 @@ addEventListener('resize', resize);
 let lastT = performance.now();
 function frame(now) {
   const dt = Math.min(0.05, (now - lastT) / 1000); lastT = now;
-  if (live()) update(dt);
+  if (ticking()) update(dt);
   else if (S.over) S.overT += dt;
   camStep(dt);
   draw();
@@ -921,4 +934,4 @@ newGame();
 showStart();
 requestAnimationFrame(frame);
 // для отладки из консоли: palitra.step(10) прокручивает 10 секунд игры
-window.palitra = { get S() { return S; }, cam, step(sec) { for (let i = 0; i < sec * 60; i++) if (live()) update(1 / 60); } };
+window.palitra = { get S() { return S; }, cam, step(sec) { for (let i = 0; i < sec * 60; i++) if (ticking()) update(1 / 60); } };
